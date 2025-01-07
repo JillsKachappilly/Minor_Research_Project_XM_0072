@@ -1,0 +1,363 @@
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+import pulp as plp
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+import numpy as np          
+import warnings
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, r2_score
+
+def load_data(file_path):
+    """
+    Load data from Excel file containing multiple sheets
+    """
+    return {
+        'trade_details': pd.read_excel(file_path, sheet_name=0),
+        'fee_schedules': pd.read_excel(file_path, sheet_name=1),
+        'gbp_ref_fee': pd.read_excel(file_path, sheet_name=2)
+    }
+
+# data_preprocessor.py
+def process_trade_details(trade_details_df):
+    """
+    Process trade details by calculating days difference and maturity brackets
+    """
+    df = trade_details_df.copy()
+    df['Days Difference'] = (df['DateUsedFeeCalc'] - df['Trade Date']).dt.days
+    df['Maturity Bracket'] = df['Days Difference'].apply(_assign_maturity_bracket)
+    return df
+
+def _assign_maturity_bracket(days):
+    """
+    Assign maturity bracket based on days
+    """
+    if days < 365:
+        return '<13Months'
+    elif 365 <= days < 365*4:
+        return '>=13Months to <4Years'
+    else:
+        return '>=4Years'
+
+def prepare_monthly_data(merged_df, gbp_ref_fee_df):
+    """
+    Process and merge monthly data
+    """
+    gbp_ref_fee_df['YearMonth'] = pd.to_datetime(gbp_ref_fee_df['Year-Month'], format='%Y-%m').dt.to_period('M')
+    merged_df['YearMonth'] = merged_df['Trade Date'].dt.to_period('M')
+    return pd.merge(merged_df, gbp_ref_fee_df[['YearMonth', 'GBP_Ref_Rate']], how='left', on='YearMonth')
+
+# fee_calculator.py
+def calculate_plan_fees(merged_df, plan_prefix):
+    """
+    Calculate fees for a specific plan
+    """
+    fee_column_map = {
+        '<13Months': '<13Months',
+        '>=13Months to <4Years': '>=13Months to <4Years',
+        '>=4Years': '>=4Years'
+    }
+    plan_df = merged_df[merged_df['Fee Plan'] == plan_prefix]
+    merged_df.loc[plan_df.index, f'{plan_prefix}_Fee'] = plan_df.apply(
+        lambda row: (row['Local Size'] * row[fee_column_map[row['Maturity Bracket']]]) / 1000, axis=1)
+    return merged_df[f'{plan_prefix}_Fee'].sum()
+
+def calculate_monthly_fees(merged_df, fee_schedules_df):
+    """
+    Calculate monthly fees for all plans
+    """
+    results = []
+    for year_month, group in merged_df.groupby('YearMonth'):
+        gbp_ref_rate = group['GBP_Ref_Rate'].iloc[0]
+        month_results = {'Year-Month': year_month}
+        
+        for plan in ['A', 'B', 'C']:
+            fee = calculate_plan_fees(group, plan)
+            fee_gbp = round(fee * gbp_ref_rate)
+            min_commitment = fee_schedules_df.loc[
+                fee_schedules_df['Fee Plan'] == plan, 
+                'Minimum Monthly commitment'
+            ].values[0]
+            fee_with_commitment = max(fee_gbp, min_commitment)
+            month_results[f'Plan {plan} Fee'] = fee_with_commitment
+            
+        results.append(month_results)
+    
+    return pd.DataFrame(results)
+
+# optimization.py
+
+def create_optimization_problem(optimal_plan_df, switching_cost=1000):
+    """
+    Create and solve the optimization problem for plan switching
+    """
+    prob = plp.LpProblem("Fee_Minimization", plp.LpMinimize)
+    plans = ['A', 'B', 'C']
+    months = list(optimal_plan_df['Year-Month'])
+    
+    # Create decision variables
+    x = plp.LpVariable.dicts("Optimal_Plan_Choice", 
+                              [(i, j) for i in plans for j in months], 
+                              cat='Binary')
+    switch = plp.LpVariable.dicts("Switch", 
+                                   [(i, j) for i in plans for j in months], 
+                                   cat='Binary')
+    
+    # Create fee dictionary
+    plan_fee_dict = {
+        (plan, month): optimal_plan_df.loc[
+            optimal_plan_df['Year-Month'] == month, 
+            f'Plan {plan} Fee'
+        ].values[0]
+        for plan in plans for month in months
+    }
+    
+    # Define the objective function
+    prob += (plp.lpSum(x[i, j] * plan_fee_dict[(i, j)] for i in plans for j in months) +
+         plp.lpSum(switch[i, j] * switching_cost for i in plans for j in months))
+
+    # Add constraints
+    _add_plan_constraints(prob, x, switch, plans, months)
+    
+    return prob
+
+
+def _add_plan_constraints(prob, x, switch, plans, months):
+    """
+    Add constraints for the optimization problem:
+    - One plan per month.
+    - Switching only with a 1-month notice period.
+    - At most one switch per month.
+    """
+    # Ensure only one plan is chosen per month
+    for j in months:
+        prob += plp.lpSum(x[i, j] for i in plans) == 1, f"One_Plan_Per_Month_{j}"
+
+    # Enforce 1-month notice period for plan changes
+    for idx in range(1, len(months)):
+        curr_month = months[idx]
+        one_month_prior = months[idx - 1]
+
+        for i in plans:
+            # If switching to plan i, it can only happen if it was planned in the prior month (notice period).
+            prob += x[i, curr_month] <= plp.lpSum(x[k, one_month_prior] for k in plans if k != i), f"Notice_Period_Constraint_{i}_{curr_month}"
+
+            # Define the switch variable: Switch occurs when the plan changes
+            prob += switch[i, curr_month] >= x[i, curr_month] - x[i, one_month_prior], f"Switch_Definition_{i}_{curr_month}"
+
+    # Ensure at most one switch happens per month across all plans
+    for idx in range(1, len(months)):
+        curr_month = months[idx]
+        prob += plp.lpSum(switch[i, curr_month] for i in plans) <= 1, f"Max_One_Switch_Per_Month_{curr_month}"
+
+
+def main(file_path):
+    # Load data
+    data = load_data(file_path)
+    
+    # Process trade details
+    processed_trades = process_trade_details(data['trade_details'])
+    
+    # Merge with fee schedules
+    merged_df = pd.merge(
+        processed_trades, 
+        data['fee_schedules'], 
+        how='left', 
+        left_on=['Product'], 
+        right_on=['Products']
+    )
+    
+    # Prepare monthly data
+    monthly_data = prepare_monthly_data(merged_df, data['gbp_ref_fee'])
+    
+    # Calculate fees
+    fee_results = calculate_monthly_fees(monthly_data, data['fee_schedules'])
+    
+    # Calculate optimal plans and fees
+    optimal_plan_df = fee_results.copy()
+    optimal_plan_df['Optimal Plan'] = optimal_plan_df[['Plan A Fee', 'Plan B Fee', 'Plan C Fee']].idxmin(axis=1).str.extract(r'(A|B|C)')[0]
+    optimal_plan_df['Total Fee'] = optimal_plan_df[['Plan A Fee', 'Plan B Fee', 'Plan C Fee']].min(axis=1)
+    optimal_plan_df['Fee saved'] = optimal_plan_df['Plan A Fee'] - optimal_plan_df['Total Fee']
+    
+    # Adding necessary columns for plot_selected_plans
+    optimal_plan_df['Selected Plan'] = optimal_plan_df['Optimal Plan']
+    optimal_plan_df['Fee'] = optimal_plan_df['Total Fee']
+    
+    # Create and solve optimization problem
+    prob = create_optimization_problem(optimal_plan_df)
+    prob.solve()
+    
+    # Export detailed results
+    optimal_plan_df.to_excel("detailed_plan_results.xlsx", index=False)
+    
+    # Plot selected plans
+    plot_selected_plans(optimal_plan_df)
+    
+    # Stationarity test
+    test_stationarity(optimal_plan_df, 'Plan A Fee')
+    
+    # Decompose time series
+    frequency = 12
+    decomposition_result = decompose_time_series(optimal_plan_df, 'Plan A Fee', frequency)
+    
+    return {
+        'optimal_plan_df': optimal_plan_df,
+        'optimization_result': plp.value(prob.objective),
+    }
+
+
+def plot_selected_plans(selected_plan_df):
+    """
+    Plot the selected plans and their fees over time.
+    """
+    selected_plan_df['Year-Month'] = selected_plan_df['Year-Month'].dt.to_timestamp()
+
+    plt.figure(figsize=(14, 7))
+    sns.lineplot(data=selected_plan_df, x='Year-Month', y='Fee', hue='Selected Plan', marker='o')
+    plt.title('Monthly Plan Selection Based on the Optimization Model')
+    plt.xticks(rotation=45)
+    plt.ylabel('Fee (in GBP)')
+    plt.xlabel('Year-Month')
+    plt.legend(title='Selected Plan')
+    plt.tight_layout()
+    plt.show()
+
+
+
+def test_stationarity(data, column):
+    """
+    Perform Augmented Dickey-Fuller test to check for stationarity in a given column.
+    """
+    result = adfuller(data[column].dropna())
+    print('ADF Statistic:', result[0])
+    print('p-value:', result[1])
+    for key, value in result[4].items():
+        print(f'Critical Value {key}: {value}')
+    if result[1] <= 0.05:
+        print("The series is stationary.")
+    else:
+        print("The series is not stationary.")
+
+def decompose_time_series(data, column, frequency):
+    data = data.set_index(pd.to_datetime(data['Year-Month'].astype(str)))
+    
+    # Perform decomposition
+    decomposition = seasonal_decompose(data[column], model='additive', period=frequency)
+    
+    # Plot the decomposition with months on x-axis
+    decomposition.plot()
+    plt.suptitle(f'{column} Time-Series Decomposition', fontsize=14)
+    plt.tight_layout()
+    plt.show()
+    
+    return decomposition
+
+def arima_xgb_hybrid_forecast(data, column, test_data, forecast_periods, arima_order=(1, 0, 3)):
+    """
+    Perform ARIMA-XGB hybrid forecasting with tuned XGBoost for the given column in the dataset.
+    """
+    # Prepare data
+    data['YearMonth'] = pd.to_datetime(data['Year-Month'].astype(str))
+    data.set_index('YearMonth', inplace=True)
+    data.index.freq = 'MS'
+    
+    test_data['YearMonth'] = pd.to_datetime(test_data['Year-Month'].astype(str))
+    test_data.set_index('YearMonth', inplace=True)
+    
+    # Fit ARIMA
+    arima_model = ARIMA(data[column], order=arima_order)
+    arima_result = arima_model.fit()
+    
+    # Forecast and calculate residuals
+    arima_forecast = arima_result.get_forecast(steps=len(test_data))
+    arima_predicted = arima_forecast.predicted_mean
+    arima_residuals = arima_result.resid
+    
+    # Prepare residuals for XGBoost
+    residuals_df = data.copy()
+    residuals_df['Residuals'] = arima_residuals
+    residuals_df.dropna(inplace=True)
+    
+    residuals_df['Month'] = residuals_df.index.month
+    residuals_df['Year'] = residuals_df.index.year
+    
+    # Train-test split for residuals
+    X = residuals_df[['Year', 'Month']]
+    y = residuals_df['Residuals']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Define tuned XGBoost model
+    tuned_xgb_model = XGBRegressor(
+        colsample_bytree=0.8, 
+        learning_rate=0.02,
+        max_depth=7,
+        n_estimators=100,
+        subsample=0.8,
+        random_state=42
+    )
+    
+    # Fit XGBoost model
+    tuned_xgb_model.fit(X_train, y_train)
+    
+    # Forecast future residuals using XGBoost
+    test_data['Month'] = test_data.index.month
+    test_data['Year'] = test_data.index.year
+    test_X = test_data[['Year', 'Month']]
+    future_residuals = tuned_xgb_model.predict(test_X)
+    
+    # Combine ARIMA and XGBoost predictions
+    hybrid_forecast = arima_predicted + future_residuals
+    
+    # Calculate metrics
+    hybrid_rmse = np.sqrt(mean_squared_error(test_data[column], hybrid_forecast))
+    hybrid_r2 = r2_score(test_data[column], hybrid_forecast)
+    print(f"Hybrid RMSE: {hybrid_rmse}")
+    print(f"Hybrid R2: {hybrid_r2}")
+    
+    # Plot the results (removed training data)
+    plt.figure(figsize=(12, 6))
+    plt.plot(test_data[column], label='Actual Data', linestyle='--', color='red')
+    plt.plot(test_data.index, arima_predicted, label='ARIMA Prediction', linestyle='-.', color='orange')
+    plt.plot(test_data.index, hybrid_forecast, label='Hybrid Forecast', linestyle=':', color='green')
+    plt.title(f'ARIMA-XGB Hybrid Forecast for {column}')
+    plt.legend()
+    plt.xlabel('Date')
+    plt.ylabel(column + ' (£) ')
+    plt.tight_layout()
+    plt.show()
+    
+    return hybrid_forecast, hybrid_rmse, hybrid_r2
+
+def perform_hybrid_forecasting(optimal_plan_df):
+    """
+    Perform ARIMA-XGB hybrid forecasting on the selected plan fees.
+    """
+    test_data = pd.read_excel("C:/Users/jills/Desktop/Test_set.xlsx")
+    forecast_periods = 12  # Number of months to forecast
+    hybrid_forecast, hybrid_rmse, hybrid_r2 = arima_xgb_hybrid_forecast(optimal_plan_df, 'Plan A Fee', test_data, forecast_periods)
+    
+    # Save results
+    forecast_results = pd.DataFrame({
+        'Date': test_data.index,
+        'Hybrid Forecast': hybrid_forecast,
+        'Actual': test_data['Plan A Fee']
+    })
+    forecast_results.to_excel("hybrid_forecast_results.xlsx", index=False)
+    
+    print(f"Hybrid Model Evaluation - RMSE: {hybrid_rmse}, R2: {hybrid_r2}")
+    return forecast_results
+
+
+
+if __name__ == "__main__":
+    file_path = "C:/Users/jills/Desktop/Sample Data.xlsx"
+    results = main(file_path)
+    print(f"Total Minimum Cost: {results['optimization_result']}")
+    hybrid_forecasts = perform_hybrid_forecasting(results['optimal_plan_df'])
+    print(hybrid_forecasts)
+
