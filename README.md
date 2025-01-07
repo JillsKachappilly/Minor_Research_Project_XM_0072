@@ -106,8 +106,8 @@ Install dependencies using the provided `requirements.txt`.
 ## Contact
 
 For questions or feedback, please contact:
-- **Name**: [Your Name]
-- **Email**: [Your Email]
+- **Name**: Jills Jose
+- **Email**: j.jose@student.vu.nl
 
 ---
 
